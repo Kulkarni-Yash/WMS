@@ -592,9 +592,12 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
       Object.keys(p.values).length
         ? { docKey: p.docKey, values: p.values, confidence: p.confidence || {} }
         : null;
-    const primed = (draft && draft.values) || backfilled;
+    const primed = draft || backfilled;
     const detectedDoc =
-      (primed && DOC_TYPES.find((d) => d.key === primed.docKey)) || ranks[0] || null;
+      (primed && DOC_TYPES.find((d) => d.key === primed.docKey)) ||
+      (primed && DOC_TYPES.find((d) => d.label === primed.docLabel)) ||
+      ranks[0] ||
+      null;
     const docKey = detectedDoc ? detectedDoc.key : "";
     const fields = fieldsByLabel[detectedDoc?.label] || [];
     const extracting = !draft; // draft = user already reviewed → no bot call
@@ -609,6 +612,7 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
         detected: detectedDoc,
         alternatives: ranks.slice(0, 4),
         docKey,
+        docLabel: detectedDoc?.label || "",
         fields,
         values: { ...(primed ? primed.values : {}) },
         confidence: primed?.confidence || {},
@@ -628,6 +632,12 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
     // tilted photo often grabs keyboard/desktop noise instead).
     (async () => {
       const stamp = editStamp;
+      const opening = {
+        docKey,
+        docLabel: detectedDoc?.label || "",
+        fullText: (draft && draft.fullText) || p.fullText || "",
+        parentLink: (draft && draft.parentLink) || defaultLinkFor(detectedDoc),
+      };
       let image = null;
       if (p.mime && p.mime.startsWith("image/")) {
         try {
@@ -638,31 +648,34 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
           }
         } catch {}
       }
-      const ex = await extractFieldsSmart(p.fullText || "", detectedDoc?.label, fields, image);
+      const ex = await extractFieldsSmart(opening.fullText, opening.docLabel, fields, image);
+      // Persist the result even if the review was cancelled mid-extraction, so a
+      // re-open restores these values instead of re-running the bot. Only skip
+      // the write when the user edited values while the bot was still running.
       setReviews((prev) => {
-        let updated = null;
+        const open = prev.some((r) => r.pendingId === p.id);
+        let match = false;
         const next = prev.map((r) => {
           if (r.pendingId !== p.id) return r;
-          if (r.editStamp === stamp) {
-            updated = {
-              ...r,
-              values: { ...(ex.values || {}) },
-              confidence: ex.confidence || {},
-              extracting: false,
-              aiUnavailable: !!ex.usingFallback,
-              image,
-            };
-            return updated;
-          }
-          return r.extracting ? { ...r, extracting: false } : r;
+          match = r.editStamp === stamp;
+          if (!match) return r.extracting ? { ...r, extracting: false } : r;
+          return {
+            ...r,
+            values: { ...(ex.values || {}) },
+            confidence: ex.confidence || {},
+            extracting: false,
+            aiUnavailable: !!ex.usingFallback,
+            image,
+          };
         });
-        if (updated) {
+        if (match || !open) {
           cacheReview(p.id, {
-            docKey: updated.docKey,
-            values: updated.values,
-            confidence: updated.confidence || {},
-            fullText: updated.fullText,
-            parentLink: updated.parentLink,
+            docKey: opening.docKey,
+            docLabel: opening.docLabel,
+            values: { ...(ex.values || {}) },
+            confidence: ex.confidence || {},
+            fullText: opening.fullText,
+            parentLink: opening.parentLink,
           });
         }
         return next;
@@ -711,6 +724,7 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
       if (updated) {
         cacheReview(id, {
           docKey: updated.docKey,
+          docLabel: updated.docLabel,
           values: updated.values,
           confidence: updated.confidence || {},
           fullText: updated.fullText,
@@ -735,6 +749,7 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
       if (updated)
         cacheReview(id, {
           docKey: updated.docKey,
+          docLabel: updated.docLabel,
           values: updated.values,
           confidence: updated.confidence || {},
           fullText: updated.fullText,
@@ -787,6 +802,7 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
     });
     patchReview(id, {
       docKey: key,
+      docLabel: doc.label,
       fields: newFields,
       values,
       confidence: extraction.confidence,
@@ -818,6 +834,7 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
           if (updated) {
             cacheReview(id, {
               docKey: updated.docKey,
+              docLabel: updated.docLabel,
               values: updated.values,
               confidence: updated.confidence || {},
               fullText: updated.fullText,
