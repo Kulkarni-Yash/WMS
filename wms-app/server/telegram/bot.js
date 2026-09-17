@@ -7,7 +7,7 @@ import TelegramBot from "node-telegram-bot-api";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_FILE = path.join(__dirname, "config.json");
-const INGEST_URL = process.env.INGEST_URL || "http://localhost:4001/api/ingest";
+const INGEST_URL = process.env.INGEST_URL || "https://wms-app-orpin.vercel.app/api/imports";
 
 let bot = null;
 

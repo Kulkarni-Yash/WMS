@@ -581,9 +581,10 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
   const openPendingReview = (p) => {
     if (reviews.some((r) => r.pendingId === p.id)) return; // already open
     const ranks = detectDocType(p.fullText || "");
-    // Re-open fast from the browser cache; the FIRST open always runs the
-    // NVIDIA bot (visible progress) even when Java already back-filled values.
-    const cached = loadCachedReview(p.id);
+    // Re-open fast from the per-document browser draft; the FIRST open always
+    // runs the NVIDIA bot (visible progress) even when Java already back-filled
+    // values. Drafts are keyed by document id so reviews never mix.
+    const draft = loadCachedReview(p.id);
     const backfilled =
       p.docKey &&
       DOC_TYPES.some((d) => d.key === p.docKey) &&
@@ -591,18 +592,19 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
       Object.keys(p.values).length
         ? { docKey: p.docKey, values: p.values, confidence: p.confidence || {} }
         : null;
-    const primed = (cached && cached.values) || backfilled;
+    const primed = (draft && draft.values) || backfilled;
     const detectedDoc =
       (primed && DOC_TYPES.find((d) => d.key === primed.docKey)) || ranks[0] || null;
     const docKey = detectedDoc ? detectedDoc.key : "";
     const fields = fieldsByLabel[detectedDoc?.label] || [];
-    const extracting = !cached; // cached = user already reviewed → no bot call
+    const extracting = !draft; // draft = user already reviewed → no bot call
+    const editStamp = 0;
     setReviews((prev) => [
       ...prev,
       {
         pendingId: p.id,
         fileName: p.fileName,
-        fullText: p.fullText || "",
+        fullText: (draft && draft.fullText) || p.fullText || "",
         pages: p.pages || [],
         detected: detectedDoc,
         alternatives: ranks.slice(0, 4),
@@ -610,12 +612,13 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
         fields,
         values: { ...(primed ? primed.values : {}) },
         confidence: primed?.confidence || {},
-        parentLink: defaultLinkFor(detectedDoc),
+        parentLink: (draft && draft.parentLink) || defaultLinkFor(detectedDoc),
         extracting,
         image: null,
         mime: p.mime || "",
         aiUnavailable: false,
         reExtracting: false,
+        editStamp,
       },
     ]);
     if (!extracting) return;
@@ -624,6 +627,7 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
     // document image and let the vision model read it directly (OCR text on a
     // tilted photo often grabs keyboard/desktop noise instead).
     (async () => {
+      const stamp = editStamp;
       let image = null;
       if (p.mime && p.mime.startsWith("image/")) {
         try {
@@ -635,25 +639,33 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
         } catch {}
       }
       const ex = await extractFieldsSmart(p.fullText || "", detectedDoc?.label, fields, image);
-      // Only update this review; other open reviews keep their own state.
-      setReviews((prev) =>
-        prev.map((r) =>
-          r.pendingId === p.id
-            ? {
-                ...r,
-                values: { ...(ex.values || {}) },
-                confidence: ex.confidence || {},
-                extracting: false,
-                aiUnavailable: !!ex.usingFallback,
-                image,
-              }
-            : r,
-        ),
-      );
-      cacheReview(p.id, {
-        docKey,
-        values: { ...(ex.values || {}) },
-        confidence: ex.confidence || {},
+      setReviews((prev) => {
+        let updated = null;
+        const next = prev.map((r) => {
+          if (r.pendingId !== p.id) return r;
+          if (r.editStamp === stamp) {
+            updated = {
+              ...r,
+              values: { ...(ex.values || {}) },
+              confidence: ex.confidence || {},
+              extracting: false,
+              aiUnavailable: !!ex.usingFallback,
+              image,
+            };
+            return updated;
+          }
+          return r.extracting ? { ...r, extracting: false } : r;
+        });
+        if (updated) {
+          cacheReview(p.id, {
+            docKey: updated.docKey,
+            values: updated.values,
+            confidence: updated.confidence || {},
+            fullText: updated.fullText,
+            parentLink: updated.parentLink,
+          });
+        }
+        return next;
       });
     })();
   };
@@ -661,6 +673,7 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
   const rerunExtract = async (id) => {
     const target = reviews.find((r) => r.pendingId === id);
     if (!target || target.reExtracting) return;
+    const stamp = target.editStamp;
     patchReview(id, { reExtracting: true });
     let image = target.image;
     if (!image && target.mime && target.mime.startsWith("image/")) {
@@ -678,14 +691,34 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
       target.fields || [],
       image,
     );
-    patchReview(id, (r) => ({
-      ...r,
-      values: { ...(ex.values || {}) },
-      confidence: ex.confidence || {},
-      aiUnavailable: !!ex.usingFallback,
-      reExtracting: false,
-      image: image || r.image,
-    }));
+    setReviews((prev) => {
+      let updated = null;
+      const next = prev.map((r) => {
+        if (r.pendingId !== id) return r;
+        if (r.editStamp === stamp) {
+          updated = {
+            ...r,
+            values: { ...(ex.values || {}) },
+            confidence: ex.confidence || {},
+            aiUnavailable: !!ex.usingFallback,
+            reExtracting: false,
+            image: image || r.image,
+          };
+          return updated;
+        }
+        return r.reExtracting ? { ...r, reExtracting: false } : r;
+      });
+      if (updated) {
+        cacheReview(id, {
+          docKey: updated.docKey,
+          values: updated.values,
+          confidence: updated.confidence || {},
+          fullText: updated.fullText,
+          parentLink: updated.parentLink,
+        });
+      }
+      return next;
+    });
   };
 
   const patchReview = (id, updater) =>
@@ -699,7 +732,14 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
         }
         return merged;
       });
-      if (updated) cacheReview(id, { docKey: updated.docKey, values: updated.values, confidence: updated.confidence || {} });
+      if (updated)
+        cacheReview(id, {
+          docKey: updated.docKey,
+          values: updated.values,
+          confidence: updated.confidence || {},
+          fullText: updated.fullText,
+          parentLink: updated.parentLink,
+        });
       return next;
     });
 
@@ -752,22 +792,40 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
       confidence: extraction.confidence,
       parentLink: defaultLinkFor(doc),
       extracting: !!target.image,
+      editStamp: target.editStamp + 1,
     });
     // A photo's OCR text is unreliable; when a document image is stored,
     // re-run extraction against the vision model so changing the doc type
     // triggers a proper re-scan instead of re-reading garble.
     if (target.image) {
+      const stamp = target.editStamp + 1;
       extractFieldsSmart(target.fullText || "", doc.label, newFields, target.image).then((ex) => {
-        patchReview(id, (r) =>
-          r.docKey === key
-            ? {
+        setReviews((prev) => {
+          let updated = null;
+          const next = prev.map((r) => {
+            if (r.pendingId !== id || r.docKey !== key) return r;
+            if (r.editStamp === stamp) {
+              updated = {
                 ...r,
                 values: { ...(ex.values || {}) },
                 confidence: ex.confidence || {},
                 extracting: false,
-              }
-            : r,
-        );
+              };
+              return updated;
+            }
+            return r.extracting ? { ...r, extracting: false } : r;
+          });
+          if (updated) {
+            cacheReview(id, {
+              docKey: updated.docKey,
+              values: updated.values,
+              confidence: updated.confidence || {},
+              fullText: updated.fullText,
+              parentLink: updated.parentLink,
+            });
+          }
+          return next;
+        });
       });
     }
   };
@@ -776,14 +834,16 @@ export default function ImportPage({ fieldsByLabel = {}, linkOptions = {}, onOpe
     const target = reviews.find((r) => r.pendingId === id);
     if (!target) return;
     const extraction = extractFieldValues(target.fullText || "", target.fields || []);
-    patchReview(id, {
+    patchReview(id, (r) => ({
+      ...r,
+      editStamp: r.editStamp + 1,
       values: { ...extraction.values },
       confidence: extraction.confidence,
-    });
+    }));
   };
 
   const setReviewValue = (key, value, id) =>
-    patchReview(id, (r) => ({ ...r, values: { ...r.values, [key]: value } }));
+    patchReview(id, (r) => ({ ...r, editStamp: r.editStamp + 1, values: { ...r.values, [key]: value } }));
 
   const setReviewParentLink = (value, id) => patchReview(id, { parentLink: value });
 
